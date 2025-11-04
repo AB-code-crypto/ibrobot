@@ -1,105 +1,215 @@
+# robot.py
+from __future__ import annotations
+
 import asyncio
 import logging
-import signal
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from ib_insync import IB
 from core.config import LOGGING, IB_CONFIG, TELEGRAM
-from infra.ib_connection import IBConnectionService
-from infra.telegram import TelegramClient, AsyncTelegramLogHandler, OrdersNotifier
+from core.telegram import TelegramLogPump, TelegramClient
 
-_LEVELS = {
-    "CRITICAL": logging.CRITICAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-}
+# Локальная тайм-зона
+TZ = ZoneInfo("Europe/Tallinn")
 
+
+# ------------------------------- утилиты логирования -------------------------------
 
 def _setup_logging() -> None:
-    level = _LEVELS.get(LOGGING.level.upper(), logging.DEBUG)
-    logging.basicConfig(level=level, format=LOGGING.fmt)
-    logging.captureWarnings(True)
-    logging.getLogger(__name__).info("🚀 Робот стартует. Лог-уровень: %s", LOGGING.level)
+    level = getattr(logging, LOGGING.level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format=LOGGING.fmt,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
-async def _install_telegram() -> tuple[AsyncTelegramLogHandler | None, OrdersNotifier | None]:
+def _now() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ------------------------------- IB: сводка при старте ----------------------------
+
+def _compose_startup_snapshot(ib: IB) -> str:
     """
-    Подключает телеграм-логгер (если включён) и готовит отправитель приказов.
-    Вся логика отправки — внутри infra.telegram.*
+    Делает небогатую, но полезную сводку из кэша ib_insync:
+    аккаунт(ы), NetLiq/AvailableFunds (USD), кэш по валютам, позиции.
+    Только plain-text, без угловых скобок и форматирования.
     """
-    # Логи → канал логов
-    tg_handler: AsyncTelegramLogHandler | None = None
-    orders: OrdersNotifier | None = None
+    # Эти коллекции в ib_insync наполняются событием после connectAsync()
+    acc_vals = ib.accountValues() or []
+    positions = ib.positions() or []
+    portfolio = ib.portfolio() or []
 
-    if TELEGRAM.enabled_logs and TELEGRAM.bot_token and TELEGRAM.chat_id_logs:
-        client = TelegramClient(TELEGRAM.bot_token, timeout=7.0, parse_mode="HTML")
-        tg_handler = AsyncTelegramLogHandler(
-            client=client,
-            chat_id=TELEGRAM.chat_id_logs,
-            level=_LEVELS.get(LOGGING.level.upper(), logging.DEBUG),
-            silent_exceptions=False,
-        )
-        tg_handler.setFormatter(logging.Formatter(LOGGING.fmt))
-        logging.getLogger().addHandler(tg_handler)
-        tg_handler.start()
-        logging.getLogger(__name__).info("✈️ Телеграм-логгер активирован: чат %s", TELEGRAM.chat_id_logs)
-        # Приказы → отдельный канал (включаем только если разрешено)
-        if TELEGRAM.enabled_trade and TELEGRAM.chat_id_trade:
-            orders = OrdersNotifier(client, TELEGRAM.chat_id_trade)
-            logging.getLogger(__name__).info("🧾 Канал приказов активирован: чат %s", TELEGRAM.chat_id_trade)
-    else:
-        logging.getLogger(__name__).info("Телеграм-логгер отключён (см. core/config.py → TELEGRAM)")
+    accounts = sorted({av.account for av in acc_vals}) or ["?"]
 
-    return tg_handler, orders
+    def _get(tag: str, currency: str | None = None) -> str:
+        for av in acc_vals:
+            if av.tag == tag and (currency is None or av.currency == currency):
+                return str(av.value)
+        return "n/a"
+
+    # Базовые метрики
+    netliq_usd = _get("NetLiquidation", "USD")
+    avail_usd = _get("AvailableFunds", "USD")
+    cash_usd = _get("TotalCashBalance", "USD")
+    cash_eur = _get("TotalCashBalance", "EUR")
+
+    # Короткий перечень позиций
+    pos_lines = []
+    for p in positions[:10]:  # не распыляемся
+        sym = getattr(p.contract, "localSymbol", None) or getattr(p.contract, "symbol", "?")
+        qty = p.position
+        pos_lines.append(f"- {sym}: {qty:g}")
+
+    # Итоговый текст
+    lines = [
+        "Служебная сводка при старте:",
+        f"Аккаунты: {', '.join(accounts)}",
+        f"NetLiq USD: {netliq_usd}",
+        f"AvailableFunds USD: {avail_usd}",
+        f"Cash USD: {cash_usd} | EUR: {cash_eur}",
+        f"Позиций: {len(positions)}; в портфеле записей: {len(portfolio)}",
+    ]
+    if pos_lines:
+        lines.append("Топ позиций:")
+        lines.extend(pos_lines)
+    return "\n".join(lines)
 
 
-async def _run():
-    _setup_logging()
+# ------------------------------- задачи: часовые маяки ----------------------------
 
-    tg_handler, orders = await _install_telegram()  # orders пока не используем на шаге 1
-    svc = IBConnectionService(IB_CONFIG)
-
-    stop_event = asyncio.Event()
-
-    def _on_stop(*_):
-        logging.getLogger(__name__).info("🧹 Сигнал остановки получен, завершаю ...")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGINT, signal.SIGTERM):
+async def _hour_beacons(pump: TelegramLogPump | None) -> None:
+    if not pump or not TELEGRAM.enabled_logs:
+        return
+    # ждём ближайший верх часа
+    now = datetime.now(TZ)
+    next_top = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+    await asyncio.sleep((next_top - now).total_seconds())
+    while True:
         try:
-            loop.add_signal_handler(s, _on_stop)
-        except NotImplementedError:
-            # Windows: сигналы частично, Ctrl+C поймаем как KeyboardInterrupt
-            pass
+            stamp = next_top.strftime("%Y-%m-%d %H:00")
+            await pump.send(f"⏱ Начало часа: {stamp} (Europe/Tallinn)")
+            # следующий час
+            next_top = next_top + timedelta(hours=1)
+            await asyncio.sleep( (next_top - datetime.now(TZ)).total_seconds() )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.getLogger("robot").exception("Часовой маяк: ошибка: %s", e)
+            await asyncio.sleep(5)
 
-    # 1) Первичное подключение (ошибка — наверх; "если падаем — падаем")
-    await svc.connect_initial()
 
-    # 2) Монитор соединения — исключения не теряем
+# ------------------------------- задачи: охрана соединения ------------------------
+
+async def _guard_connection(ib: IB, pump: TelegramLogPump | None) -> None:
+    """
+    Единственная задача, которая следит за соединением и переподключает.
+    Без множества подписок на события, чтобы не словить гонки.
+    """
+    log = logging.getLogger("robot")
+    base = IB_CONFIG.base_retry_delay
+    maxd = IB_CONFIG.max_retry_delay
+    period = IB_CONFIG.health_check_period
+
+    backoff = base
+    first_connect_done = False
+
+    while True:
+        try:
+            if not ib.isConnected():
+                msg = "🔗 Подключаюсь к IB ..."
+                log.info(msg)
+                if pump and TELEGRAM.enabled_logs:
+                    await pump.send(msg)
+
+                try:
+                    await ib.connectAsync(IB_CONFIG.host, IB_CONFIG.port, IB_CONFIG.client_id)
+                except Exception as e:
+                    log.warning("Не удалось подключиться: %s", e)
+                    if pump and TELEGRAM.enabled_logs:
+                        await pump.send(f"⚠️ Подключение не удалось: {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.7, maxd)
+                    continue
+
+                # Подключились
+                backoff = base
+                stamp = _now()
+                ok_msg = f"✅ Подключено к IB {IB_CONFIG.host}:{IB_CONFIG.port} (clientId={IB_CONFIG.client_id}) в {stamp}"
+                log.info(ok_msg)
+                if pump and TELEGRAM.enabled_logs:
+                    await pump.send(ok_msg)
+
+                # Дать IB чуть времени на первичную синхронизацию
+                await asyncio.sleep(0.8)
+
+                if not first_connect_done:
+                    snap = _compose_startup_snapshot(ib)
+                    log.info(snap.replace("\n", " | "))
+                    if pump and TELEGRAM.enabled_logs:
+                        await pump.send(snap)
+                    first_connect_done = True
+            else:
+                # живём, просто ждём
+                await asyncio.sleep(period)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.exception("Сторож соединения: ошибка: %s", e)
+            await asyncio.sleep(2)
+
+
+# ------------------------------- основная корутина --------------------------------
+
+async def amain() -> None:
+    _setup_logging()
+    log = logging.getLogger("robot")
+    log.info("🚀 Робот стартует. Лог-уровень: %s", LOGGING.level.upper())
+
+    # Телеграм (plain-text). Насос логов включаем только если разрешено.
+    tg_client = TelegramClient()
+    pump: TelegramLogPump | None = None
+    if TELEGRAM.enabled_logs:
+        pump = TelegramLogPump(tg_client, to="logs", max_queue=1000)
+        pump.start()
+        await pump.send("✈️ Телеграм-логгер активирован")
+
+    ib = IB()
+
+    # Доп. сообщения при разрыве/закрытии (без подписок на множество событий)
+    async def _graceful_disconnect():
+        try:
+            if ib.isConnected():
+                log.info("🔌 Отключаюсь от IB ...")
+                await asyncio.to_thread(ib.disconnect)  # безопасно вынести в thread
+        finally:
+            if pump:
+                await pump.send("🔚 Соединение закрыто")
+            if pump:
+                await pump.stop()
+
+    # Параллельные задачи: охрана соединения и часовые маяки
+    guard_task = asyncio.create_task(_guard_connection(ib, pump), name="ib-guard")
+    beacons_task = asyncio.create_task(_hour_beacons(pump), name="hour-beacons")
+
+    # Ожидаем Ctrl+C или падение задач
     try:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(svc.monitor_forever(stop_event), name="ib-monitor")
-            await stop_event.wait()
+        await asyncio.gather(guard_task, beacons_task)
+    except asyncio.CancelledError:
+        pass
     finally:
-        await svc.disconnect()
-        if tg_handler:
-            await tg_handler.stop()
-        logging.getLogger(__name__).info("✅ Робот завершил работу корректно.")
+        await _graceful_disconnect()
 
 
-def main():
+def main() -> None:
     try:
-        asyncio.run(_run())
+        asyncio.run(amain())
     except KeyboardInterrupt:
-        print("\n^C — остановлено пользователем.")
-    except Exception as e:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
-        )
-        logging.getLogger(__name__).exception("💥 Критическая ошибка робота: %s", e)
-        raise
+        # красивый выход
+        logging.getLogger("robot").info("✅ Робот завершил работу корректно.")
 
 
 if __name__ == "__main__":

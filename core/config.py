@@ -34,7 +34,7 @@ class DBConfig:
 class TelegramConfig:
     # единый бот, два канала: торговля (приказы) и логи
     enabled_trade: bool = False
-    enabled_logs: bool = False
+    enabled_logs: bool = True
     bot_token: str = "8121278489:AAFrj5FlOQmT4lctIfHOFmkqOqDL60vq5zg"
     chat_id_trade: int = -1002621383506
     chat_id_logs: int = -1003208160378
