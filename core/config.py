@@ -1,6 +1,6 @@
-# ibrobot/core/config.py
 from __future__ import annotations
 from dataclasses import dataclass
+
 
 @dataclass(frozen=True)
 class IBConfig:
@@ -11,10 +11,12 @@ class IBConfig:
     max_retry_delay: float
     health_check_period: float
 
+
 @dataclass(frozen=True)
 class LoggingConfig:
     level: str
     fmt: str
+
 
 @dataclass(frozen=True)
 class DBConfig:
@@ -24,6 +26,7 @@ class DBConfig:
     temp_store: str = "MEMORY"
     busy_timeout_ms: int = 5000
 
+
 @dataclass(frozen=True)
 class TelegramConfig:
     enabled: bool
@@ -31,8 +34,9 @@ class TelegramConfig:
     chat_id_alerts: int
     chat_id_logs: int
 
+
 @dataclass(frozen=True)
 class HistoryConfig:
-    timeframe_sec: int = 5        # базовая частота
-    use_rth: int = 0              # 0 = расширенный RTH (как обсудили)
+    timeframe_sec: int = 5  # базовая частота
+    use_rth: int = 0  # 0 = расширенный RTH (как обсудили)
     what_to_show: str = "TRADES"  # источник

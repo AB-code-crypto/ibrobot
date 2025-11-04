@@ -1,10 +1,9 @@
-# robot.py
 import asyncio
 import logging
 import signal
 
-from ibrobot.settings import IB_CONFIG, LOGGING
-from ibrobot.infra.ib_connection import IBConnectionService
+from infra.ib_connection import IBConnectionService
+from settings import IB_CONFIG, LOGGING
 
 # Маппинг уровней, чтобы не использовать getattr
 _LEVELS = {
@@ -15,11 +14,13 @@ _LEVELS = {
     "DEBUG": logging.DEBUG,
 }
 
+
 def _setup_logging():
     level = _LEVELS.get(LOGGING.level.upper(), logging.DEBUG)
     logging.basicConfig(level=level, format=LOGGING.fmt)
     logging.captureWarnings(True)
     logging.getLogger(__name__).info("🚀 Робот стартует. Лог-уровень: %s", LOGGING.level)
+
 
 async def _run():
     _setup_logging()
@@ -27,6 +28,7 @@ async def _run():
     svc = IBConnectionService(IB_CONFIG)
 
     stop_event = asyncio.Event()
+
     def _on_stop(*_):
         logging.getLogger(__name__).info("🧹 Сигнал остановки получен, завершаю ...")
         stop_event.set()
@@ -50,6 +52,7 @@ async def _run():
         await svc.disconnect()
         logging.getLogger(__name__).info("✅ Робот завершил работу корректно.")
 
+
 def main():
     try:
         asyncio.run(_run())
@@ -59,6 +62,7 @@ def main():
         logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
         logging.getLogger(__name__).exception("💥 Критическая ошибка робота: %s", e)
         raise
+
 
 if __name__ == "__main__":
     main()

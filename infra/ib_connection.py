@@ -1,14 +1,15 @@
-# ibrobot/infra/ib_connection.py
 from __future__ import annotations
 import asyncio
 import logging
+from core.config import IBConfig
 from ib_insync import IB, util
-from ibrobot.core.config import IBConfig
 
 log = logging.getLogger(__name__)
 
+
 class IBConnectionError(Exception):
     pass
+
 
 class IBConnectionService:
     """
@@ -17,6 +18,7 @@ class IBConnectionService:
       • удержание и реконнект в одном цикле мониторинга
     Исключения наружу — без "тихого" падения.
     """
+
     def __init__(self, cfg: IBConfig):
         self.cfg = cfg
         self.ib = IB()
