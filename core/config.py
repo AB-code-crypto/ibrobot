@@ -17,7 +17,15 @@ class IBConfig:
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    level: str = "DEBUG"
+    # CRITICAL = 50
+    # FATAL = CRITICAL
+    # ERROR = 40
+    # WARNING = 30
+    # WARN = WARNING
+    # INFO = 20
+    # DEBUG = 10
+    # NOTSET = 0
+    level: str = "INFO"
     fmt: str = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 
 

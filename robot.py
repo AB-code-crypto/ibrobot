@@ -1,4 +1,3 @@
-# robot.py
 from __future__ import annotations
 
 import asyncio
@@ -11,13 +10,13 @@ from core.config import LOGGING, IB_CONFIG, TELEGRAM
 from core.telegram import TelegramLogPump, TelegramClient
 
 # Локальная тайм-зона
-TZ = ZoneInfo("Europe/Tallinn")
+TZ = ZoneInfo("Europe/Moscow")
 
 
 # ------------------------------- утилиты логирования -------------------------------
 
 def _setup_logging() -> None:
-    level = getattr(logging, LOGGING.level.upper(), logging.INFO)
+    level = LOGGING.level.upper()
     logging.basicConfig(
         level=level,
         format=LOGGING.fmt,
@@ -143,7 +142,7 @@ async def _guard_connection(ib: IB, pump: TelegramLogPump | None) -> None:
                     await pump.send(ok_msg)
 
                 # Дать IB чуть времени на первичную синхронизацию
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.0)
 
                 if not first_connect_done:
                     snap = _compose_startup_snapshot(ib)
@@ -187,7 +186,7 @@ async def amain() -> None:
                 await asyncio.to_thread(ib.disconnect)  # безопасно вынести в thread
         finally:
             if pump:
-                await pump.send("🔚 Соединение закрыто")
+                await pump.send("=======================\n🔚 Соединение закрыто\n=======================")
             if pump:
                 await pump.stop()
 
