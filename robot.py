@@ -111,7 +111,7 @@ class PortfolioWatcher:
             self.log.info(f"Открыта позиция: {sym} {side} qty={new_qty:g}")
             if TELEGRAM.enabled_logs:
                 asyncio.create_task(
-                    self.tg.send_text(f"📈 Открыта позиция: <b>{sym}</b> {side} qty=<b>{new_qty:g}</b>\n"
+                    self.tg.send_text(f"📈 Открыта позиция: {sym} {side} qty={new_qty:g}\n"
                                       f"uPnL: {upnl:+.2f}")
                 )
 
@@ -123,7 +123,7 @@ class PortfolioWatcher:
             self.log.info(f"Закрыта позиция: {sym} {side} qty=0")
             if TELEGRAM.enabled_logs:
                 asyncio.create_task(
-                    self.tg.send_text(f"📉 Закрыта позиция: <b>{sym}</b> ({side})\n"
+                    self.tg.send_text(f"📉 Закрыта позиция: {sym} ({side})\n"
                                       f"rPnL: {rpnl:+.2f}")
                 )
 
