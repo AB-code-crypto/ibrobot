@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("robot")
 
-# --- константы проекта (при желании перенесёте в core.config) ---
+# --- константы проекта ---
 PROJECT_ROOT = Path(__file__).parent
 DB_PATH = PROJECT_ROOT / "data" / "ib_bars.sqlite"
 ACTIVE_LOCAL_SYMBOL = "MNQZ5"  # рабочий фьючерс
@@ -60,7 +60,7 @@ async def hourly_beacon(tg: TelegramClient, stop: asyncio.Event) -> None:
 
 
 async def run_all(stop: asyncio.Event) -> None:
-    # 1) Телеграм-клиент (токен/чаты берёт из core.config)
+    # 1) Телеграм-клиент (берёт токен/чаты из core.config)
     tg = TelegramClient()
 
     # 2) Сервис соединения с IB
@@ -79,8 +79,8 @@ async def run_all(stop: asyncio.Event) -> None:
 
     tasks = [
         asyncio.create_task(ib_service.monitor_forever(stop), name="ib_monitor"),
-        asyncio.create_task(watcher.start(), name="portfolio_watch"),  # без stop — как в вашей сигнатуре
-        asyncio.create_task(bars.run(stop), name="bars_collector"),
+        asyncio.create_task(watcher.start(), name="portfolio_watch"),  # без stop — по вашей сигнатуре
+        asyncio.create_task(bars.run(), name="bars_collector"),        # БЕЗ аргумента stop
         asyncio.create_task(hourly_beacon(tg, stop), name="hourly_beacon"),
     ]
 
@@ -91,7 +91,7 @@ async def run_all(stop: asyncio.Event) -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
-        # Отмена и дожидание задач
+        # Мягкая остановка: отменяем и дожидаемся задач
         for t in tasks:
             if not t.done():
                 t.cancel()
