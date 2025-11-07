@@ -1,198 +1,153 @@
-"""
-Robot runner with IB connection, portfolio watcher, hour beacons,
-and BarsCollector integration (5s bars to SQLite).
-Assumptions:
-- core.config provides IB_CONFIG, LOGGING, TELEGRAM (no env/getattr).
-- core.telegram provides TelegramClient() (no-arg) with async post(text).
-- core.bars_collector provides BarsCollector(symbol:str, db_path:Path).
-If bars_collector is missing, we log a warning and continue without it.
-"""
+# ibrobot/robot.py
+from __future__ import annotations
 
 import asyncio
 import logging
 import signal
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from typing import Optional
 
-from ib_insync import IB
-
-from core.bars_collector import BarsCollector
-from core.config import IB_CONFIG, LOGGING, TELEGRAM
+from core.config import LOGGING, IB_CONFIG, TELEGRAM
+from core.ib_connection import IBConnectionService
 from core.portfolio_watch import PortfolioWatcher
 from core.telegram import TelegramClient
+from core.bars_collector import BarsCollector, BarsCollectorConfig
 
-# --- Timezone ----------------------------------------------------------------
-TZ = ZoneInfo("Europe/Moscow")
+# ---- Константы запуска (минимально нужное) ----------------------------------
 
-# --- Logging setup ------------------------------------------------------------
-_level_map = {
-    "CRITICAL": logging.CRITICAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-}
-lvl = _level_map.get(str(LOGGING.level).upper(), logging.INFO)
-logging.basicConfig(level=lvl, format=LOGGING.fmt)
-log = logging.getLogger("robot")
+# Рабочий инструмент – активный фьючерс (можно поменять одной строкой)
+ACTIVE_LOCAL_SYMBOL: str = "MNQZ5"
 
-# --- Graceful shutdown --------------------------------------------------------
-class Shutdown:
-    def __init__(self):
-        self._event = asyncio.Event()
-    def set(self):
-        self._event.set()
-    async def wait(self):
-        await self._event.wait()
+DB_PATH: Path = Path(__file__).parent / "data" / "ib_bars.sqlite"
 
-shutdown = Shutdown()
 
-def _install_signal_handlers():
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(s, shutdown.set)
-        except NotImplementedError:
-            # Windows/PyCharm fallback
-            pass
+# ---- Вспомогательное ---------------------------------------------------------
 
-# --- Hourly beacons -----------------------------------------------------------
-async def hour_beacons(tg: TelegramClient):
-    last_hour = None
-    while not shutdown._event.is_set():
-        now_hour = datetime.now(TZ).replace(minute=0, second=0, microsecond=0)
-        if now_hour != last_hour:
-            last_hour = now_hour
-            msg = f"⏱ Начало часа: {now_hour:%Y-%m-%d %H:%M}"
-            log.info(msg)
-            if TELEGRAM.enabled_logs:
-                try:
-                    await tg.post(msg)
-                except Exception:
-                    pass
-        try:
-            await asyncio.wait_for(shutdown.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
+def _level_to_int(name: str) -> int:
+    name_u = (name or "").upper()
+    if name_u == "DEBUG":
+        return logging.DEBUG
+    if name_u == "INFO":
+        return logging.INFO
+    if name_u == "WARNING":
+        return logging.WARNING
+    if name_u == "ERROR":
+        return logging.ERROR
+    if name_u == "CRITICAL":
+        return logging.CRITICAL
+    return logging.INFO
 
-# --- IB guard: connect / reconnect / notify ----------------------------------
-async def ib_guard(ib: IB, tg: TelegramClient, bars: BarsCollector, watcher: PortfolioWatcher):
-    backoff = 2.0
-    while not shutdown._event.is_set():
-        try:
-            log.info("🔗 Подключаюсь к IB ...")
-            await ib.connectAsync(IB_CONFIG.host, IB_CONFIG.port, clientId=IB_CONFIG.client_id)
-            log.info("✅ Подключено к IB %s:%s (clientId=%s) в %s",
-                     IB_CONFIG.host, IB_CONFIG.port, IB_CONFIG.client_id,
-                     datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"))
-            if TELEGRAM.enabled_logs:
-                try:
-                    await tg.post("✅ Подключился к IB")
-                except Exception:
-                    pass
 
-            await bars.on_connected(ib)
-            await watcher.on_connected()
+def setup_logging() -> logging.Logger:
+    logging.basicConfig(
+        level=_level_to_int(LOGGING.level),
+        format=str(LOGGING.fmt),
+    )
+    return logging.getLogger("robot")
 
-            # Wait for disconnect/shutdown
-            while ib.isConnected() and not shutdown._event.is_set():
-                await asyncio.sleep(0.5)
 
-            await watcher.on_disconnected()
-            await bars.on_disconnected()
+# ---- Основной запускатор -----------------------------------------------------
 
-            if shutdown._event.is_set():
-                break
-
-            log.info("🔌 Соединение потеряно, пробую восстановить...")
-            if TELEGRAM.enabled_logs:
-                try:
-                    await tg.post("🔌 Соединение потеряно, пробую восстановить...")
-                except Exception:
-                    pass
-
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.7, 30.0)
-
-        except Exception as e:
-            log.error("Ошибка подключения/работы: %s", e, exc_info=False)
-            if TELEGRAM.enabled_logs:
-                try:
-                    await tg.post(f"⚠️ Ошибка подключения: {e}")
-                except Exception:
-                    pass
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 1.7, 30.0)
-
-# --- Bars collector bootstrap -------------------------------------------------
-@dataclass(frozen=True)
-class BarsOptions:
-    symbol: str
-    db_path: Path
-
-def _discover_db_path() -> Path:
-    try:
-        from core.config import HISTORY  # type: ignore
-        p = Path(getattr(HISTORY, "db_path"))
-        if p:
-            return p
-    except Exception:
-        pass
-    return Path("./history/history.sqlite")
-
-def parse_args():
-    import argparse
-    ap = argparse.ArgumentParser(description="IB robot (with BarsCollector)")
-    ap.add_argument("--symbol", default=getattr(IB_CONFIG, "active_symbol", "MNQZ5"),
-                    help="Active contract symbol, e.g. MNQZ5")
-    ap.add_argument("--db", default=str(_discover_db_path()), help="SQLite DB path")
-    return ap.parse_args()
-
-# --- Main --------------------------------------------------------------------
-async def amain():
-    _install_signal_handlers()
-
-    args = parse_args()
+async def run_all(stop_event: asyncio.Event) -> None:
+    log = setup_logging()
     log.info("🚀 Робот стартует. Лог-уровень: %s", LOGGING.level)
 
-    tg = TelegramClient()
-    ib = IB()
+    # 1) Телеграм (используем конфиг напрямую, без дублей)
+    tg = TelegramClient(TELEGRAM.bot_token)
 
-    # Bars collector
-    bars = BarsCollector(symbol=args.symbol, db_path=Path(args.db))
+    # 2) Сервис соединения с IB
+    ib_svc = IBConnectionService(IB_CONFIG, log)
+
+    # 3) Вотчер портфеля (события открытия/закрытия/частичные изменения уже реализованы в core)
+    watcher = PortfolioWatcher(
+        ib=ib_svc.ib,
+        tg=tg,
+        chat_id_logs=TELEGRAM.chat_id_logs,
+        poll_snapshot_on_connect=True,
+    )
+
+    # 4) Сборщик 5-сек баров в SQLite (активный + соседние фьючерсы)
+    bars_cfg = BarsCollectorConfig(
+        db_path=str(DB_PATH),
+        active_local_symbol=ACTIVE_LOCAL_SYMBOL,
+        # Остальные поля оставляем дефолтными в dataclass
+    )
+    collector = BarsCollector(ib=ib_svc.ib, cfg=bars_cfg, logger=log)
+
+    # --- Асинхронные задачи ---
+    tasks: list[asyncio.Task] = []
+
+    # Поддержание соединения (автореконнект, бипы и т.п.)
+    tasks.append(asyncio.create_task(ib_svc.monitor_forever(stop_event), name="ib_guard"))
+
+    # Вотчер портфеля
+    tasks.append(asyncio.create_task(watcher.start(stop_event), name="portfolio_watch"))
+
+    # Сборщик баров (создаст БД/таблицу если нужно, подтянет историю и дальше будет дозаливать)
+    tasks.append(asyncio.create_task(collector.run(stop_event), name="bars_collector"))
+
+    # Стартовая служебная метка в телеграм (по желанию пользователя)
+    if TELEGRAM.enabled_logs:
+        try:
+            await tg.send_text(
+                TELEGRAM.chat_id_logs,
+                f"🤖 Робот запущен. Актив: {ACTIVE_LOCAL_SYMBOL}. БД: {DB_PATH.as_posix()}",
+            )
+        except Exception:
+            log.exception("Не удалось отправить стартовое сообщение в Telegram")
+
+    # Ожидаем завершение stop_event и всех задач
     try:
-        await bars.start()
-    except Exception:
-        pass
-
-    watcher = PortfolioWatcher(ib, tg, log)
-
-    # Run tasks
-    tasks = [
-        asyncio.create_task(ib_guard(ib, tg, bars, watcher), name="ib_guard"),
-        asyncio.create_task(hour_beacons(tg), name="hour_beacons"),
-        asyncio.create_task(watcher.run(), name="portfolio_watcher"),
-    ]
-
-    try:
-        await shutdown.wait()
+        await stop_event.wait()
     finally:
+        # Мягко остановим все задачи
         for t in tasks:
             t.cancel()
+        # Дадим задачам время схлопнуться
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Корректно закрываем соединение и телеграм
         try:
-            await bars.stop()
+            await ib_svc.disconnect()
         except Exception:
-            pass
-        if ib.isConnected():
-            log.info("🔌 Отключаюсь от IB ...")
-            ib.disconnect()
+            log.exception("Ошибка при отключении IB")
+
+        try:
+            await tg.aclose()
+        except Exception:
+            log.exception("Ошибка при закрытии Telegram клиента")
+
         log.info("✅ Робот завершил работу корректно.")
 
-def main():
-    asyncio.run(amain())
+
+def _install_signal_handlers(stop_event: asyncio.Event, log: logging.Logger) -> None:
+    def _stop(*_: object) -> None:
+        # Идемпотентно выставляем флаг остановки
+        if not stop_event.is_set():
+            log.info("🛑 Получен сигнал на остановку, завершаю...")
+            stop_event.set()
+
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, lambda *_: _stop())
+            except Exception:
+                # На Windows SIGTERM может отсутствовать — это ок
+                pass
+    # PyCharm/Windows иногда шлет SIGBREAK
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, lambda *_: _stop())
+        except Exception:
+            pass
+
+
+def main() -> None:
+    log = setup_logging()
+    stop_event = asyncio.Event()
+    _install_signal_handlers(stop_event, log)
+    asyncio.run(run_all(stop_event))
+
 
 if __name__ == "__main__":
     main()
