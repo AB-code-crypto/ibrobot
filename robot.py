@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from core.config import LOGGING, IB_CONFIG, TELEGRAM  # все настройки только отсюда
+from core.config import LOGGING, IB_CONFIG, TELEGRAM
 from core.telegram import TelegramClient
 from core.ib_connection import IBConnectionService
 from core.portfolio_watch import PortfolioWatcher
@@ -27,70 +27,63 @@ logging.basicConfig(
 )
 log = logging.getLogger("robot")
 
-# --- константы проекта (можете перенести в core.config) ---
+# --- константы проекта (при желании перенесёте в core.config) ---
 PROJECT_ROOT = Path(__file__).parent
 DB_PATH = PROJECT_ROOT / "data" / "ib_bars.sqlite"
-ACTIVE_LOCAL_SYMBOL = "MNQZ5"  # рабочий фьючерс (перенесёте в config при желании)
+ACTIVE_LOCAL_SYMBOL = "MNQZ5"  # рабочий фьючерс
 
 # --- служебный фон: «маяк» на начало часа ---
 async def hourly_beacon(tg: TelegramClient, stop: asyncio.Event) -> None:
     """
-    Раз в час шлём отметку о начале часа.
+    Раз в час шлём отметку о начале часа (UTC).
     """
     try:
         while not stop.is_set():
             now = datetime.now(timezone.utc)
-            # Следующее целое начало часа (UTC)
             nxt = (now.replace(minute=0, second=0, microsecond=0)
                    + timedelta(hours=1))
-            await asyncio.wait_for(stop.wait(), timeout=(nxt - now).total_seconds())
-            if stop.is_set():
+            timeout = (nxt - now).total_seconds()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=timeout)
                 break
+            except asyncio.TimeoutError:
+                pass
 
             msg = f"⏰ Начало часа: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-            # В телеграм шлём только если включено логирование
             if getattr(TELEGRAM, "enabled_logs", True):
                 await tg.post_logs(msg)
             log.info(msg)
     except asyncio.CancelledError:
-        # нормальное завершение
         raise
     except Exception:
         log.exception("Ошибка в hourly_beacon")
 
 
 async def run_all(stop: asyncio.Event) -> None:
-    # 1) Телеграм-клиент (берёт токен и чаты из core.config)
-    tg = TelegramClient()  # ВАЖНО: без аргументов — как в вашей core/telegram.py
+    # 1) Телеграм-клиент (токен/чаты берёт из core.config)
+    tg = TelegramClient()
 
     # 2) Сервис соединения с IB
     ib_service = IBConnectionService(IB_CONFIG)
-    ib = ib_service.ib  # общий IB-инстанс для остальных задач
+    ib = ib_service.ib
 
-    # 3) Наблюдение портфеля (открытия/закрытия/частичное изменение)
+    # 3) Наблюдение портфеля
     watcher = PortfolioWatcher(ib, tg, log)
 
-    # 4) Сборщик 5-сек баров (активный + соседние)
+    # 4) Сборщик 5-сек баров
     bars_cfg = BarsCollectorConfig(
         db_path=DB_PATH,
         active_local_symbol=ACTIVE_LOCAL_SYMBOL,
-        # остальные поля конфигурации BarsCollectorConfig — со значениями по умолчанию
     )
     bars = BarsCollector(ib, bars_cfg, logger=log)
 
-    # Параллельно работаем тремя корутинами:
-    #  - монитор соединения (реконнект)
-    #  - наблюдатель портфеля
-    #  - сборщик баров
-    #  - часовой маяк
     tasks = [
         asyncio.create_task(ib_service.monitor_forever(stop), name="ib_monitor"),
-        asyncio.create_task(watcher.start(stop), name="portfolio_watch"),
+        asyncio.create_task(watcher.start(), name="portfolio_watch"),  # без stop — как в вашей сигнатуре
         asyncio.create_task(bars.run(stop), name="bars_collector"),
         asyncio.create_task(hourly_beacon(tg, stop), name="hourly_beacon"),
     ]
 
-    # Шлём стартовое сообщение
     log.info("🚀 Робот стартует. Лог-уровень: %s", LOGGING.level)
     if getattr(TELEGRAM, "enabled_logs", True):
         await tg.post_logs("🤖 Робот запущен.")
@@ -98,7 +91,7 @@ async def run_all(stop: asyncio.Event) -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
-        # Аккуратное завершение
+        # Отмена и дожидание задач
         for t in tasks:
             if not t.done():
                 t.cancel()
@@ -117,7 +110,6 @@ async def run_all(stop: asyncio.Event) -> None:
 
 def main() -> None:
     stop = asyncio.Event()
-
     try:
         asyncio.run(run_all(stop))
     except KeyboardInterrupt:
